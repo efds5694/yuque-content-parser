@@ -1,0 +1,41 @@
+{
+  "manifest_version": 3,
+  "name": "语雀 AI 编辑器",
+  "version": "0.1.3",
+  "description": "使用本地 Codex 审阅并安全写回语雀原文档",
+  "permissions": [
+    "activeTab",
+    "debugger",
+    "scripting",
+    "sidePanel",
+    "storage",
+    "webNavigation"
+  ],
+  "host_permissions": [
+    "https://www.yuque.com/*",
+    "https://*.yuque.com/*",
+    "http://127.0.0.1/*"
+  ],
+  "background": {
+    "service_worker": "background.js",
+    "type": "module"
+  },
+  "action": {
+    "default_title": "打开语雀 AI 编辑器"
+  },
+  "side_panel": {
+    "default_path": "sidepanel.html"
+  },
+  "content_scripts": [
+    {
+      "matches": [
+        "https://www.yuque.com/*",
+        "https://*.yuque.com/*"
+      ],
+      "js": ["content.js"],
+      "run_at": "document_idle",
+      "all_frames": true,
+      "match_about_blank": true
+    }
+  ]
+}

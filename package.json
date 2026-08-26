@@ -1,0 +1,14 @@
+{
+  "name": "yuque-ai-editor",
+  "version": "0.1.3",
+  "private": true,
+  "type": "module",
+  "description": "在语雀原文档中审阅并应用 Codex 段落级修订",
+  "scripts": {
+    "test": "node --test",
+    "check": "node scripts/check-extension.mjs"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}

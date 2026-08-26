@@ -1,0 +1,78 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>语雀 AI 编辑器</title>
+  <link rel="stylesheet" href="sidepanel.css">
+</head>
+<body>
+  <main>
+    <header class="app-header">
+      <div>
+        <p class="eyebrow">YUQUE × CODEX</p>
+        <h1>语雀 AI 编辑器</h1>
+      </div>
+      <span id="editorBadge" class="badge neutral">检查页面</span>
+    </header>
+
+    <section class="card settings-card">
+      <details id="settings">
+        <summary>本地服务设置</summary>
+        <label for="bridgeUrl">服务地址</label>
+        <input id="bridgeUrl" type="url" spellcheck="false" value="http://127.0.0.1:32145">
+        <label for="bridgeToken">配对码</label>
+        <div class="row">
+          <input id="bridgeToken" type="password" spellcheck="false" placeholder="从 start.cmd 窗口复制">
+          <button id="pairButton" class="secondary compact" type="button">连接</button>
+        </div>
+        <p id="bridgeStatus" class="hint">请先双击项目中的 start.cmd。</p>
+      </details>
+    </section>
+
+    <section class="card">
+      <fieldset>
+        <legend>编辑范围</legend>
+        <label class="radio-row">
+          <input type="radio" name="scope" value="selection" checked>
+          <span><strong>当前选区</strong><small>先在正文中选中文字，按完整段落审阅</small></span>
+        </label>
+        <label class="radio-row">
+          <input type="radio" name="scope" value="document">
+          <span><strong>整篇文档</strong><small>最多 500 个块或 100,000 字</small></span>
+        </label>
+      </fieldset>
+
+      <label for="instruction">修改要求</label>
+      <textarea id="instruction" rows="6" placeholder="例如：检查错别字和病句，统一日期格式，语言保持正式简洁；不要改变事实。"></textarea>
+      <button id="generateButton" class="primary" type="button">读取文档并生成建议</button>
+      <p id="workStatus" class="status-line" aria-live="polite"></p>
+    </section>
+
+    <section id="resultSection" class="card hidden">
+      <div class="result-heading">
+        <div>
+          <p class="eyebrow">修订预览</p>
+          <h2 id="resultTitle">待确认的修改</h2>
+        </div>
+        <span id="acceptedCount" class="badge neutral">0 项</span>
+      </div>
+      <p id="summary" class="summary"></p>
+      <div id="warnings" class="warnings hidden"></div>
+      <div class="toolbar">
+        <button id="acceptAll" class="text-button" type="button">全选</button>
+        <button id="rejectAll" class="text-button" type="button">全不选</button>
+      </div>
+      <div id="operations" class="operations"></div>
+      <button id="applyButton" class="primary danger-safe" type="button">应用已选修改</button>
+      <p class="hint">只有点击此按钮后才会写入语雀；写入前会再次检查文档版本。</p>
+    </section>
+
+    <section id="logSection" class="card hidden">
+      <p class="eyebrow">操作结果</p>
+      <div id="log" class="log" aria-live="polite"></div>
+    </section>
+  </main>
+  <script type="module" src="sidepanel.js"></script>
+</body>
+</html>
