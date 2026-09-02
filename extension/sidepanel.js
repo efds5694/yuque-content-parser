@@ -1,36 +1,23 @@
-import {
-  BRIDGE_DEFAULT_URL,
-  OPERATION_TYPES,
-  normalizeBridgeUrl,
-  validateRevisionRequest,
-  validateRevisionResponse,
-} from "./lib/protocol.js";
+import { MAX_LAKE_BYTES, parseLake } from "./lib/parser.js";
+import { safeFilename, serializeHtml, serializeJson, serializeMarkdown } from "./lib/serializers.js";
 
 const elements = Object.fromEntries([
-  "editorBadge", "settings", "bridgeUrl", "bridgeToken", "pairButton", "bridgeStatus",
-  "instruction", "generateButton", "workStatus", "resultSection", "resultTitle", "acceptedCount",
-  "summary", "warnings", "acceptAll", "rejectAll", "operations", "applyButton", "logSection", "log",
+  "pageBadge", "closeButton", "sourceAuto", "sourcePage", "sourceLake", "autoControls", "pageControls", "lakeControls", "selectionHint",
+  "lakeFile", "fileHint", "parseButton", "workStatus", "resultSection", "resultTitle", "fidelityBadge",
+  "stats", "diagnosticsBox", "diagnosticsSummary", "diagnostics", "textPreview", "htmlPreview",
+  "copyButton", "downloadButton",
 ].map((id) => [id, document.getElementById(id)]));
 
-let revisionState = null;
+const formats = {
+  markdown: { label: "Markdown", extension: "md", mime: "text/markdown;charset=utf-8" },
+  html: { label: "富文本", extension: "html", mime: "text/html;charset=utf-8" },
+  json: { label: "JSON", extension: "json", mime: "application/json;charset=utf-8" },
+};
+
 let busy = false;
-
-function setBadge(text, style = "neutral") {
-  elements.editorBadge.textContent = text;
-  elements.editorBadge.className = `badge ${style}`;
-}
-
-function setStatus(text, style = "") {
-  elements.workStatus.textContent = text;
-  elements.workStatus.className = `status-line ${style}`.trim();
-}
-
-function setBusy(value) {
-  busy = value;
-  elements.generateButton.disabled = value;
-  elements.applyButton.disabled = value || !revisionState;
-  elements.pairButton.disabled = value;
-}
+let parseResult = null;
+let outputs = null;
+let activeFormat = "markdown";
 
 async function background(message) {
   const response = await chrome.runtime.sendMessage(message);
@@ -38,243 +25,282 @@ async function background(message) {
   return response.value;
 }
 
-async function settings() {
-  const stored = await chrome.storage.local.get(["bridgeUrl", "bridgeToken"]);
-  return {
-    bridgeUrl: normalizeBridgeUrl(stored.bridgeUrl || BRIDGE_DEFAULT_URL),
-    bridgeToken: String(stored.bridgeToken || ""),
+function setStatus(message, style = "") {
+  elements.workStatus.textContent = message;
+  elements.workStatus.className = `status-line ${style}`.trim();
+}
+
+function setBusy(value) {
+  busy = value;
+  elements.parseButton.disabled = value;
+  elements.copyButton.disabled = value || !parseResult;
+  elements.downloadButton.disabled = value || !parseResult;
+}
+
+function selectedSource() {
+  return document.querySelector('input[name="source"]:checked')?.value || "page";
+}
+
+function selectedScope() {
+  return document.querySelector('input[name="scope"]:checked')?.value || "selection";
+}
+
+function clearResult() {
+  parseResult = null;
+  outputs = null;
+  elements.resultSection.classList.add("hidden");
+  elements.textPreview.textContent = "";
+  elements.htmlPreview.srcdoc = "";
+}
+
+function updateParseButton() {
+  const source = selectedSource();
+  if (source === "current-lake") elements.parseButton.textContent = "一键解析当前文档";
+  else if (source === "lake") elements.parseButton.textContent = "解析 .lake 文件";
+  else elements.parseButton.textContent = selectedScope() === "selection" ? "解析当前选区" : "扫描整篇文档";
+}
+
+function updateSourceControls() {
+  const source = selectedSource();
+  elements.autoControls.classList.toggle("hidden", source !== "current-lake");
+  elements.pageControls.classList.toggle("hidden", source !== "page");
+  elements.lakeControls.classList.toggle("hidden", source !== "lake");
+  updateParseButton();
+  clearResult();
+  setStatus("");
+}
+
+function renderStats(stats) {
+  const entries = [
+    [stats.nodes || 0, "节点"],
+    [stats.characters || 0, "字符"],
+    [stats.images || 0, "图片"],
+    [stats.warnings || 0, "提示"],
+  ];
+  elements.stats.replaceChildren(...entries.map(([value, label]) => {
+    const item = document.createElement("div");
+    item.className = "stat";
+    const strong = document.createElement("strong");
+    strong.textContent = Number(value).toLocaleString("zh-CN");
+    const span = document.createElement("span");
+    span.textContent = label;
+    item.append(strong, span);
+    return item;
+  }));
+}
+
+function renderDiagnostics(diagnostics) {
+  elements.diagnostics.replaceChildren();
+  elements.diagnosticsBox.classList.toggle("hidden", diagnostics.length === 0);
+  elements.diagnosticsSummary.textContent = diagnostics.length ? `${diagnostics.length} 条解析提示` : "没有解析提示";
+  for (const entry of diagnostics) {
+    const item = document.createElement("li");
+    item.textContent = entry.message;
+    elements.diagnostics.append(item);
+  }
+  elements.diagnosticsBox.open = diagnostics.some((entry) => entry.severity === "error");
+}
+
+function outputText(format) {
+  if (!outputs) return "";
+  if (format === "html") return outputs.htmlStandalone;
+  return outputs[format];
+}
+
+function showFormat(format) {
+  activeFormat = format;
+  for (const tab of document.querySelectorAll(".tab")) {
+    const active = tab.dataset.format === format;
+    tab.classList.toggle("active", active);
+    tab.setAttribute("aria-selected", String(active));
+  }
+  const html = format === "html";
+  elements.textPreview.classList.toggle("hidden", html);
+  elements.htmlPreview.classList.toggle("hidden", !html);
+  if (html) elements.htmlPreview.srcdoc = outputs?.htmlPreview || "";
+  else elements.textPreview.textContent = outputText(format);
+  elements.copyButton.textContent = `复制${format === "html" ? "富文本" : ` ${formats[format].label}`}`;
+  elements.downloadButton.textContent = `下载 .${formats[format].extension}`;
+}
+
+function renderResult(result) {
+  parseResult = result;
+  outputs = {
+    markdown: serializeMarkdown(result),
+    htmlFragment: serializeHtml(result, { standalone: false }),
+    htmlStandalone: serializeHtml(result),
+    htmlPreview: serializeHtml(result, { blockNetwork: true }),
+    json: serializeJson(result),
   };
-}
-
-async function bridgeFetch(path, options = {}, timeoutMs = 12_000) {
-  const config = await settings();
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), timeoutMs);
-  try {
-    const response = await fetch(`${config.bridgeUrl}${path}`, {
-      ...options,
-      signal: controller.signal,
-      headers: {
-        "Content-Type": "application/json",
-        ...(config.bridgeToken ? { Authorization: `Bearer ${config.bridgeToken}` } : {}),
-        ...(options.headers || {}),
-      },
-    });
-    const body = await response.json().catch(() => ({}));
-    if (!response.ok) throw new Error(body.error || `本地服务返回 HTTP ${response.status}`);
-    return body;
-  } catch (error) {
-    if (error?.name === "AbortError") throw new Error("等待本地服务超时");
-    throw error;
-  } finally {
-    clearTimeout(timer);
-  }
-}
-
-async function refreshConnections() {
-  try {
-    const config = await settings();
-    elements.bridgeUrl.value = config.bridgeUrl;
-    elements.bridgeToken.value = config.bridgeToken;
-    const health = await bridgeFetch("/health", { method: "GET" });
-    elements.bridgeStatus.textContent = `本地服务已启动 · ${health.version}`;
-    if (config.bridgeToken) {
-      await bridgeFetch("/v1/pair", { method: "POST", body: "{}" });
-      elements.bridgeStatus.textContent = "本地服务已连接，配对码有效。";
-    }
-  } catch (error) {
-    elements.bridgeStatus.textContent = error?.message || String(error);
-  }
-
-  try {
-    const status = await background({ type: "GET_EDITOR_STATUS" });
-    if (status.ready) {
-      setBadge(status.frame?.frameId === 0 ? "编辑器就绪" : "编辑器框架就绪", "good");
-      elements.editorBadge.title = `框架 ${status.frame?.frameId ?? 0}；${status.diagnostic?.root || "未知根节点"}；Lake ID ${status.diagnostic?.lakeIdCount ?? 0}`;
-    }
-    else setBadge("请进入编辑", "bad");
-  } catch (error) {
-    setBadge("未连接语雀", "bad");
-    setStatus(error?.message || String(error), "error");
-  }
-}
-
-async function saveAndPair() {
-  if (busy) return;
-  try {
-    setBusy(true);
-    const bridgeUrl = normalizeBridgeUrl(elements.bridgeUrl.value);
-    const bridgeToken = elements.bridgeToken.value.trim();
-    if (!bridgeToken) throw new Error("请输入 start.cmd 窗口中显示的配对码");
-    await chrome.storage.local.set({ bridgeUrl, bridgeToken });
-    await bridgeFetch("/v1/pair", { method: "POST", body: "{}" });
-    elements.bridgeStatus.textContent = "连接成功，配对码已保存在本机扩展中。";
-    elements.settings.open = false;
-  } catch (error) {
-    elements.bridgeStatus.textContent = error?.message || String(error);
-  } finally {
-    setBusy(false);
-  }
-}
-
-function operationName(operation) {
-  if (operation.op === OPERATION_TYPES.REPLACE) return "修改段落";
-  if (operation.op === OPERATION_TYPES.INSERT) return "创建段落";
-  return "删除段落";
-}
-
-function appendDiff(container, label, value, className) {
-  const row = document.createElement("div");
-  row.className = `diff-row ${className}`;
-  const prefix = document.createElement("span");
-  prefix.className = "diff-label";
-  prefix.textContent = label;
-  row.append(prefix, document.createTextNode(value || "（空）"));
-  container.append(row);
-}
-
-function updateAcceptedCount() {
-  const boxes = Array.from(elements.operations.querySelectorAll('input[type="checkbox"]'));
-  const accepted = boxes.filter((box) => box.checked).length;
-  elements.acceptedCount.textContent = `${accepted}/${boxes.length} 项`;
-  elements.applyButton.disabled = busy || accepted === 0;
-}
-
-function renderRevision(revision) {
   elements.resultSection.classList.remove("hidden");
-  elements.resultTitle.textContent = revision.operations.length ? "待确认的修改" : "没有建议修改";
-  elements.summary.textContent = revision.summary || "Codex 没有提供摘要。";
-  elements.operations.replaceChildren();
-  if (revision.warnings.length) {
-    elements.warnings.classList.remove("hidden");
-    elements.warnings.textContent = revision.warnings.map((item) => `• ${item}`).join("\n");
-  } else {
-    elements.warnings.classList.add("hidden");
-    elements.warnings.textContent = "";
-  }
-
-  revision.operations.forEach((operation, index) => {
-    const article = document.createElement("article");
-    article.className = "operation";
-    const head = document.createElement("div");
-    head.className = "operation-head";
-    const checkbox = document.createElement("input");
-    checkbox.type = "checkbox";
-    checkbox.checked = true;
-    checkbox.dataset.index = String(index);
-    checkbox.addEventListener("change", updateAcceptedCount);
-    const title = document.createElement("div");
-    title.className = "operation-title";
-    title.textContent = `${index + 1}. ${operationName(operation)}`;
-    head.append(checkbox, title);
-    if (operation.factChange) {
-      const tag = document.createElement("span");
-      tag.className = "fact-tag";
-      tag.textContent = "事实变化";
-      head.append(tag);
-    }
-    const reason = document.createElement("p");
-    reason.className = "reason";
-    reason.textContent = operation.reason || "未提供修改理由";
-    const diff = document.createElement("div");
-    diff.className = "diff";
-    appendDiff(diff, "原", operation.oldText, "diff-old");
-    if (operation.op !== OPERATION_TYPES.DELETE) appendDiff(diff, "新", operation.newText, "diff-new");
-    article.append(head, reason, diff);
-    elements.operations.append(article);
-  });
-  updateAcceptedCount();
+  elements.resultTitle.textContent = result.document.title;
+  const sourceFidelity = result.document.source.fidelity === "source";
+  elements.fidelityBadge.textContent = sourceFidelity ? "Lake 高保真" : "页面尽力提取";
+  elements.fidelityBadge.className = `badge ${sourceFidelity ? "good" : "warn"}`;
+  renderStats(result.stats);
+  renderDiagnostics(result.diagnostics);
+  showFormat(activeFormat);
+  setStatus(`解析完成：${result.stats.nodes} 个语义节点。`, "success");
 }
 
-async function generateRevision() {
+async function parseSelectedSource() {
   if (busy) return;
   try {
     setBusy(true);
-    revisionState = null;
-    elements.resultSection.classList.add("hidden");
-    elements.logSection.classList.add("hidden");
-    const instruction = elements.instruction.value.trim();
-    if (!instruction) throw new Error("请输入修改要求");
-    const scope = document.querySelector('input[name="scope"]:checked')?.value || "selection";
-    setStatus(scope === "selection" ? "正在读取选中的段落…" : "正在读取整篇文档…");
-    const snapshot = await background({ type: "EXTRACT_DOCUMENT", scope });
-    if (snapshot.stats.editableCount === 0) {
-      const diagnostic = snapshot.diagnostic || {};
-      throw new Error(
-        `识别到 ${snapshot.stats.blockCount} 个块，但没有可编辑段落。`
-        + `编辑器根节点：${diagnostic.root || "未知"}；Lake ID：${diagnostic.lakeIdCount ?? 0}；候选段落：${diagnostic.candidateBlockCount ?? 0}；稳定 ID：${diagnostic.stableIdCount ?? 0}。`
-        + "请先在 edge://extensions 重新加载扩展，再刷新语雀页面；若仍出现此信息，请把这些诊断数字发给我。",
-      );
+    clearResult();
+    let result;
+    if (selectedSource() === "current-lake") {
+      setStatus("正在读取当前文档的 Lake 源内容…");
+      const current = await background({ type: "GET_CURRENT_LAKE" });
+      result = parseLake(current.lake, {
+        title: current.title,
+        url: current.url,
+        fileName: `${current.title || "语雀文档"}.lake`,
+      });
+    } else if (selectedSource() === "lake") {
+      const file = elements.lakeFile.files?.[0];
+      if (!file) throw new Error("请先选择一个 .lake 文件");
+      if (file.size > MAX_LAKE_BYTES) throw new Error(".lake 文件不能超过 20 MiB");
+      setStatus("正在本地读取并解析 .lake 文件…");
+      result = parseLake(await file.text(), { fileName: file.name });
+    } else {
+      const scope = selectedScope();
+      setStatus(scope === "selection" ? "正在解析精确选区…" : "正在滚动扫描整篇文档…");
+      result = await background({ type: "PARSE_PAGE", scope });
     }
-    const request = validateRevisionRequest({
-      scope,
-      instruction,
-      title: snapshot.title,
-      sourceHash: snapshot.sourceHash,
-      blocks: snapshot.blocks,
-    });
-    setStatus(`已读取 ${snapshot.stats.blockCount} 个块（${snapshot.stats.editableCount} 个可编辑），Codex 正在审阅…`);
-    const revision = await bridgeFetch("/v1/revise", {
-      method: "POST",
-      body: JSON.stringify(request),
-    }, 310_000);
-    const validated = validateRevisionResponse(revision, request);
-    revisionState = { snapshot, request, revision: validated };
-    renderRevision(validated);
-    setStatus(`审阅完成，共 ${validated.operations.length} 项建议。`, "success");
+    renderResult(result);
   } catch (error) {
-    revisionState = null;
     setStatus(error?.message || String(error), "error");
   } finally {
     setBusy(false);
-    if (revisionState) updateAcceptedCount();
   }
 }
 
-function selectAll(value) {
-  for (const checkbox of elements.operations.querySelectorAll('input[type="checkbox"]')) checkbox.checked = value;
-  updateAcceptedCount();
+function fallbackCopyText(value) {
+  const textarea = document.createElement("textarea");
+  textarea.value = value;
+  textarea.style.cssText = "position:fixed;opacity:0;pointer-events:none";
+  document.body.append(textarea);
+  textarea.select();
+  const copied = document.execCommand("copy");
+  textarea.remove();
+  if (!copied) throw new Error("浏览器拒绝写入剪贴板");
 }
 
-async function applyRevision() {
-  if (busy || !revisionState) return;
-  const acceptedIndexes = Array.from(elements.operations.querySelectorAll('input[type="checkbox"]:checked'))
-    .map((checkbox) => Number(checkbox.dataset.index));
-  const operations = acceptedIndexes.map((index) => revisionState.revision.operations[index]).filter(Boolean);
-  if (!operations.length) return;
+function fallbackCopyHtml(html, plainText) {
+  const container = document.createElement("div");
+  container.contentEditable = "true";
+  container.style.cssText = "position:fixed;left:-9999px;top:0";
+  container.innerHTML = html;
+  document.body.append(container);
+  const range = document.createRange();
+  range.selectNodeContents(container);
+  const selection = window.getSelection();
+  selection.removeAllRanges();
+  selection.addRange(range);
+  const onCopy = (event) => {
+    event.clipboardData?.setData("text/html", html);
+    event.clipboardData?.setData("text/plain", plainText);
+    event.preventDefault();
+  };
+  document.addEventListener("copy", onCopy, true);
+  let copied = false;
   try {
-    setBusy(true);
-    elements.logSection.classList.remove("hidden");
-    elements.log.textContent = `准备应用 ${operations.length} 项修改…`;
-    const result = await background({
-      type: "APPLY_OPERATIONS",
-      snapshot: revisionState.snapshot,
-      operations,
-    });
-    const saveMessage = result.saved === true ? "语雀已显示保存完成。" : result.warning;
-    elements.log.textContent = `成功应用 ${result.appliedCount} 项修改。\n${saveMessage || ""}`.trim();
-    setStatus("修改已写入原文档。刷新前请留意语雀保存状态。", "success");
-    revisionState = null;
-    elements.applyButton.disabled = true;
-  } catch (error) {
-    elements.log.textContent = error?.message || String(error);
-    setStatus("应用失败，详情见操作结果。", "error");
+    copied = document.execCommand("copy");
   } finally {
-    setBusy(false);
-    if (revisionState) updateAcceptedCount();
+    document.removeEventListener("copy", onCopy, true);
+    selection.removeAllRanges();
+    container.remove();
+  }
+  if (!copied) throw new Error("浏览器拒绝写入富文本剪贴板");
+}
+
+async function copyCurrent() {
+  if (!outputs || busy) return;
+  try {
+    if (activeFormat === "html") {
+      let copied = false;
+      if (navigator.clipboard?.write && typeof ClipboardItem === "function") {
+        try {
+          const item = new ClipboardItem({
+            "text/html": new Blob([outputs.htmlFragment], { type: "text/html" }),
+            "text/plain": new Blob([outputs.markdown], { type: "text/plain" }),
+          });
+          await navigator.clipboard.write([item]);
+          copied = true;
+        } catch {
+          // 语雀页面可能通过 Permissions Policy 禁止 iframe 使用 Clipboard API。
+        }
+      }
+      if (!copied) fallbackCopyHtml(outputs.htmlFragment, outputs.markdown);
+    } else {
+      const text = outputText(activeFormat);
+      let copied = false;
+      if (navigator.clipboard?.writeText) {
+        try {
+          await navigator.clipboard.writeText(text);
+          copied = true;
+        } catch {
+          // 被宿主页面策略拒绝时，退回同步复制命令。
+        }
+      }
+      if (!copied) fallbackCopyText(text);
+    }
+    setStatus(`${formats[activeFormat].label} 已复制到剪贴板。`, "success");
+  } catch (error) {
+    setStatus(error?.message || String(error), "error");
   }
 }
 
+function downloadCurrent() {
+  if (!outputs || !parseResult || busy) return;
+  const format = formats[activeFormat];
+  const suffix = parseResult.document.source.scope === "selection" ? "-选区" : "";
+  const filename = `${safeFilename(parseResult.document.title)}${suffix}.${format.extension}`;
+  const blob = new Blob([outputText(activeFormat)], { type: format.mime });
+  const url = URL.createObjectURL(blob);
+  const anchor = document.createElement("a");
+  anchor.href = url;
+  anchor.download = filename;
+  anchor.click();
+  setTimeout(() => URL.revokeObjectURL(url), 1_000);
+  setStatus(`已生成 ${filename}。`, "success");
+}
+
+async function refreshPageStatus() {
+  try {
+    const status = await background({ type: "GET_PAGE_STATUS" });
+    elements.pageBadge.textContent = status.ready ? "页面可读" : "未找到正文";
+    elements.pageBadge.className = `badge ${status.ready ? "good" : "bad"}`;
+    elements.pageBadge.title = `${status.diagnostic?.root || "未知根节点"} · ${status.diagnostic?.unitCount || 0} 个候选节点`;
+    elements.selectionHint.textContent = status.selectionCount
+      ? `已捕获 ${status.selectionCharacters} 个字符，覆盖 ${status.selectionCount} 个结构`
+      : "打开工具前先在正文中选择内容";
+  } catch (error) {
+    elements.pageBadge.textContent = "未连接页面";
+    elements.pageBadge.className = "badge bad";
+    elements.pageBadge.title = error?.message || String(error);
+  }
+}
+
+elements.closeButton.addEventListener("click", () => background({ type: "TOGGLE_INLINE_PANEL", open: false }).catch(() => {}));
+for (const input of document.querySelectorAll('input[name="source"]')) input.addEventListener("change", updateSourceControls);
+for (const input of document.querySelectorAll('input[name="scope"]')) input.addEventListener("change", () => { updateParseButton(); clearResult(); setStatus(""); });
+elements.lakeFile.addEventListener("change", () => {
+  const file = elements.lakeFile.files?.[0];
+  elements.sourceLake.checked = true;
+  updateSourceControls();
+  elements.fileHint.textContent = file
+    ? `${file.name} · ${(file.size / 1024).toLocaleString("zh-CN", { maximumFractionDigits: 1 })} KiB`
+    : "单个文件不超过 20 MiB；文件仅在本机浏览器中解析。";
+});
+elements.parseButton.addEventListener("click", parseSelectedSource);
+elements.copyButton.addEventListener("click", copyCurrent);
+elements.downloadButton.addEventListener("click", downloadCurrent);
+for (const tab of document.querySelectorAll(".tab")) tab.addEventListener("click", () => showFormat(tab.dataset.format));
 chrome.runtime.onMessage.addListener((message) => {
-  if (message?.type !== "APPLY_PROGRESS") return;
-  elements.logSection.classList.remove("hidden");
-  elements.log.textContent = message.detail || message.stage;
+  if (message?.type === "PARSE_PROGRESS" && busy) setStatus(message.detail || "正在扫描页面…");
 });
 
-elements.pairButton.addEventListener("click", saveAndPair);
-elements.generateButton.addEventListener("click", generateRevision);
-elements.acceptAll.addEventListener("click", () => selectAll(true));
-elements.rejectAll.addEventListener("click", () => selectAll(false));
-elements.applyButton.addEventListener("click", applyRevision);
-
-refreshConnections();
+updateSourceControls();
+refreshPageStatus();

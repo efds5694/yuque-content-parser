@@ -1,0 +1,20 @@
+<!doctype lake>
+<html>
+<head><meta charset="utf-8"><title>语义解析样例</title></head>
+<body>
+  <p data-lake-id="intro"><span>开始阅读</span><a href="#target"><strong>目标章节</strong></a></p>
+  <h2 data-lake-id="target" id="target"><span>目标章节</span></h2>
+  <ul><li data-lake-id="task" checked="true"><span>完成解析</span></li></ul>
+  <table data-lake-id="table"><tbody><tr><th><p>名称</p></th><th><p>内容</p></th></tr><tr><td rowspan="2"><p>合并项</p></td><td><p>第一行</p></td></tr><tr><td><p>第二行</p></td></tr></tbody></table>
+  <details data-lake-id="details"><summary>展开查看</summary><p>折叠正文</p></details>
+  <img src="https://cdn.nlark.com/yuque/test/image.png" alt="架构图" width="640" height="360">
+  <card type="block" name="codeblock" value="data:%7B%22language%22%3A%22javascript%22%2C%22code%22%3A%22const%20answer%20%3D%2042%3B%22%7D"></card>
+  <card type="block" name="diagram" value="data:%7B%22type%22%3A%22mermaid%22%2C%22code%22%3A%22graph%20TD%5CnA--%3EB%22%7D"></card>
+  <card type="inline" name="label" value="data:%7B%22label%22%3A%22%E9%87%8D%E8%A6%81%22%2C%22colorIndex%22%3A1%7D"></card>
+  <card type="block" name="attachment" value="data:%7B%22filename%22%3A%22%E9%99%84%E4%BB%B6.pdf%22%2C%22url%22%3A%22https%3A%2F%2Fcdn.nlark.com%2Fyuque%2Ftest%2Fattachment.pdf%22%2C%22size%22%3A1024%7D"></card>
+  <card type="block" name="formula" value="data:%7B%22latex%22%3A%22E%3Dmc%5E2%22%7D"></card>
+  <card type="block" name="calendar" value="data:%7B%22title%22%3A%22%E9%A1%B9%E7%9B%AE%E6%97%A5%E5%8E%86%22%2C%22url%22%3A%22https%3A%2F%2Fwww.yuque.com%2Ftest%2Fcalendar%22%2C%22privateState%22%3A%22json-only%22%7D"></card>
+  <p><a href="javascript:alert(1)">危险链接</a></p>
+  <script>globalThis.__lakeScriptExecuted = true;</script>
+</body>
+</html>

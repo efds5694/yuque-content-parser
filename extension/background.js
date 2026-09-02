@@ -1,396 +1,214 @@
-import { diffToHunks } from "./lib/diff.js";
-import { OPERATION_TYPES, validateRevisionResponse } from "./lib/protocol.js";
+const frameCache = new Map();
 
-const DEBUG_PROTOCOL_VERSION = "1.3";
-const editorFrameCache = new Map();
-
-chrome.runtime.onInstalled.addListener(() => {
-  chrome.sidePanel.setPanelBehavior({ openPanelOnActionClick: true }).catch(() => {});
-});
+function isYuqueUrl(value) {
+  try {
+    const url = new URL(value || "");
+    return url.protocol === "https:" && (url.hostname === "yuque.com" || url.hostname.endsWith(".yuque.com"));
+  } catch {
+    return false;
+  }
+}
 
 async function activeYuqueTab() {
   const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
-  let isYuque = false;
-  try {
-    const url = new URL(tab?.url || "");
-    isYuque = url.protocol === "https:" && (url.hostname === "yuque.com" || url.hostname.endsWith(".yuque.com"));
-  } catch {
-    isYuque = false;
-  }
-  if (!tab?.id || !isYuque) {
-    throw new Error("请先打开需要修改的语雀文档，并进入编辑模式");
-  }
+  if (!tab?.id || !isYuqueUrl(tab.url)) throw new Error("请先打开需要读取的语雀文档");
   return tab;
 }
 
-function probeEditorDocument() {
+function probePageDocument() {
+  const unitSelector = [
+    "p", "h1", "h2", "h3", "h4", "h5", "h6", "ul", "ol", "blockquote", "table", "details", "pre", "card",
+    "ne-p", "ne-h1", "ne-h2", "ne-h3", "ne-h4", "ne-h5", "ne-h6", "ne-tli", "ne-table", "ne-codeblock",
+    "ne-collapse", "ne-alert", "ne-card", '[ne-role="render-unit"]',
+  ].join(",");
+  const selectors = [
+    ".ne-engine", ".lake-engine", ".lake-content-editor-core", ".lake-content", "[data-lake-editor]",
+    "#doc-reader-content article", "#doc-reader-content", '[contenteditable="true"]',
+  ];
   const visible = (element) => {
     const style = getComputedStyle(element);
     const rect = element.getBoundingClientRect();
     return style.display !== "none" && style.visibility !== "hidden" && rect.width > 0 && rect.height > 0;
   };
-  const blockSelector = [
-    "p", "h1", "h2", "h3", "h4", "h5", "h6", "li",
-    "ne-p", "ne-h1", "ne-h2", "ne-h3", "ne-h4", "ne-h5", "ne-h6",
-    "ne-tli", "ne-oli-i", "ne-uli-i",
-    ".ne-p", ".ne-heading", ".ne-list-item", ".lake-p", ".lake-heading", ".lake-list-item",
-    '[data-node-type="paragraph"]', '[data-node-type="heading"]', '[data-node-type="list_item"]',
-  ].join(",");
-  const candidates = Array.from(document.querySelectorAll('[contenteditable="true"]')).filter(visible);
-  for (const selector of [".lake-engine", ".lake-content-editor-core", ".lake-content", "[data-lake-editor]"]) {
+  const candidates = [];
+  for (const selector of selectors) {
     for (const element of document.querySelectorAll(selector)) {
       if (visible(element) && !candidates.includes(element)) candidates.push(element);
     }
   }
-  const scored = candidates.map((element) => {
-    const lakeIds = element.querySelectorAll("[data-lake-id]").length;
-    const blocks = element.querySelectorAll(blockSelector).length;
-    const editable = element.matches('[contenteditable="true"]') || Boolean(element.querySelector('[contenteditable="true"]'));
+  const ranked = candidates.map((element) => {
+    const units = element.querySelectorAll(unitSelector).length;
+    const stableIds = element.querySelectorAll("[id],[data-lake-id]").length;
     const textLength = (element.textContent || "").trim().length;
+    const preferred = element.matches(".ne-engine,.lake-engine,[data-lake-editor]");
     return {
-      score: lakeIds * 100 + blocks * 20 + Math.min(textLength, 10_000) + (editable ? 50 : 0),
-      lakeIds,
-      blocks,
-      editable,
+      score: units * 40 + Math.min(stableIds, 500) * 2 + Math.min(textLength, 20_000) / 20 + (preferred ? 500 : 0),
+      units,
       textLength,
-      root: `${element.tagName.toLowerCase()}${element.id ? `#${element.id}` : ""}${element.className ? `.${String(element.className).trim().split(/\s+/u).slice(0, 3).join(".")}` : ""}`,
+      editable: Boolean(element.matches('[contenteditable="true"]') || element.querySelector('[contenteditable="true"]')),
+      root: `${element.tagName.toLocaleLowerCase("en-US")}${element.id ? `#${element.id}` : ""}`,
     };
   }).sort((left, right) => right.score - left.score);
-  return {
-    href: location.href,
-    title: document.title,
-    candidateCount: candidates.length,
-    best: scored[0] || null,
-  };
+  return { href: location.href, title: document.title, best: ranked[0] || null, candidateCount: candidates.length };
 }
 
-async function discoverEditorFrame(tabId, force = false) {
-  if (!force && editorFrameCache.has(tabId)) return editorFrameCache.get(tabId);
-  const frames = await chrome.webNavigation.getAllFrames({ tabId }) || [{ frameId: 0, url: "" }];
-  const probes = [];
-  for (const frame of frames) {
-    try {
-      const [result] = await chrome.scripting.executeScript({
-        target: { tabId, frameIds: [frame.frameId] },
-        func: probeEditorDocument,
-      });
-      if (result?.result) probes.push({ frameId: frame.frameId, frameUrl: frame.url, ...result.result });
-    } catch {
-      // 浏览器内部框架或没有 host permission 的框架不是正文编辑器。
-    }
-  }
-  const ranked = probes
-    .filter((probe) => probe.best?.editable)
+async function discoverContentFrame(tabId, force = false) {
+  if (!force && frameCache.has(tabId)) return frameCache.get(tabId);
+  const results = await chrome.scripting.executeScript({ target: { tabId, allFrames: true }, func: probePageDocument });
+  const probes = results
+    .filter((entry) => entry.result)
+    .map((entry) => ({ frameId: entry.frameId, ...entry.result }))
     .sort((left, right) => (right.best?.score || 0) - (left.best?.score || 0));
-  const selected = ranked[0] || probes.find((probe) => probe.frameId === 0);
-  if (!selected) throw new Error("无法访问语雀页面框架，请重新加载扩展和文档页面");
-  const context = { frameId: selected.frameId, diagnostic: selected, allDiagnostics: probes };
-  editorFrameCache.set(tabId, context);
+  const selected = probes.find((probe) => probe.best?.score > 0) || probes.find((probe) => probe.frameId === 0);
+  if (!selected) throw new Error("无法访问语雀页面，请重新加载扩展和文档页面");
+  const context = { frameId: selected.frameId, diagnostic: selected, frameCount: probes.length };
+  frameCache.set(tabId, context);
   return context;
 }
 
-async function sendContent(tabId, message, retryInjection = true) {
-  const frame = await discoverEditorFrame(tabId);
+async function sendContent(tabId, message, retry = true) {
+  const frame = await discoverContentFrame(tabId);
   try {
     const response = await chrome.tabs.sendMessage(tabId, message, { frameId: frame.frameId });
     if (!response?.ok) throw new Error(response?.error || "语雀页面没有返回结果");
     return response.value;
   } catch (error) {
-    const text = error?.message || String(error);
-    if (retryInjection && /(Receiving end does not exist|Could not establish connection)/iu.test(text)) {
+    const detail = error?.message || String(error);
+    if (retry && /(Receiving end does not exist|Could not establish connection)/iu.test(detail)) {
       await chrome.scripting.executeScript({ target: { tabId, frameIds: [frame.frameId] }, files: ["content.js"] });
       return sendContent(tabId, message, false);
     }
-    if (retryInjection && /(没有检测到可编辑|离开编辑模式)/u.test(text)) {
-      editorFrameCache.delete(tabId);
-      await discoverEditorFrame(tabId, true);
+    if (retry && /没有检测到语雀正文/u.test(detail)) {
+      frameCache.delete(tabId);
+      await discoverContentFrame(tabId, true);
       return sendContent(tabId, message, false);
     }
     throw error;
   }
 }
 
-chrome.tabs.onRemoved.addListener((tabId) => editorFrameCache.delete(tabId));
-chrome.tabs.onUpdated.addListener((tabId, changeInfo) => {
-  if (changeInfo.status === "loading" || changeInfo.url) editorFrameCache.delete(tabId);
+async function tabForSender(sender) {
+  if (sender?.tab?.id && isYuqueUrl(sender.tab.url)) return sender.tab;
+  return activeYuqueTab();
+}
+
+async function readCurrentLakeFromPage() {
+  const appData = globalThis.appData;
+  const book = appData?.book;
+  const currentDoc = appData?.doc;
+  const pathParts = location.pathname.split("/").filter(Boolean);
+  while (["edit", "reader"].includes(pathParts.at(-1)?.toLocaleLowerCase("en-US"))) pathParts.pop();
+  const locationSlug = pathParts.at(-1) || "";
+  const slug = locationSlug || currentDoc?.slug || "";
+  const bookId = Number(book?.id || currentDoc?.book_id);
+  if (!Number.isSafeInteger(bookId) || bookId <= 0 || !slug) {
+    throw new Error("没有从当前页面识别出语雀文档信息，请刷新文档后重试");
+  }
+
+  const tocEntry = Array.isArray(book?.toc) ? book.toc.find((item) => item?.url === slug || item?.slug === slug) : null;
+  const initialTitle = tocEntry?.title || (currentDoc?.slug === slug ? currentDoc?.title : "") || document.title || "语雀文档";
+  const query = new URLSearchParams({ book_id: String(bookId), merge_dynamic_data: "false" });
+  const response = await globalThis.fetch(`/api/docs/${encodeURIComponent(slug)}?${query}`, {
+    method: "GET",
+    credentials: "include",
+    cache: "no-store",
+    headers: { Accept: "application/json" },
+  });
+  if (!response.ok) {
+    if (response.status === 401 || response.status === 403) {
+      throw new Error("语雀拒绝读取源内容，请确认当前文档已登录且你有导出权限");
+    }
+    throw new Error(`语雀源内容读取失败（HTTP ${response.status}）`);
+  }
+
+  let payload;
+  try {
+    payload = await response.json();
+  } catch {
+    throw new Error("语雀返回了无法识别的源内容响应");
+  }
+  const data = payload?.data || payload;
+  const candidates = [data?.content, data?.body_lake, data?.bodyLake, data?.body];
+  const lake = candidates.find((value) => typeof value === "string" && /^\s*<!doctype\s+lake\b/iu.test(value))
+    || candidates.find((value) => typeof value === "string" && /<(?:card|ne-[a-z\d-]+|p|h[1-6]|table)\b/iu.test(value));
+  if (!lake) throw new Error("语雀响应中没有 Lake 正文；可改用“导入 .lake 文件”");
+
+  return {
+    lake,
+    title: data?.title || initialTitle,
+    url: (currentDoc?.slug === slug && appData?.docUrl) || `${location.origin}${location.pathname}`,
+  };
+}
+
+async function getCurrentLake(tabId) {
+  const results = await chrome.scripting.executeScript({
+    target: { tabId, frameIds: [0] },
+    world: "MAIN",
+    func: readCurrentLakeFromPage,
+  });
+  const current = results[0]?.result;
+  if (!current?.lake) throw new Error("当前语雀页面没有返回 Lake 源内容");
+  const bytes = new TextEncoder().encode(current.lake).byteLength;
+  if (bytes > 20 * 1024 * 1024) throw new Error("当前文档的 Lake 源内容超过 20 MiB 上限");
+  return current;
+}
+
+async function setInlinePanel(tabId, open, retry = true) {
+  try {
+    const response = await chrome.tabs.sendMessage(tabId, { type: "INLINE_PANEL_SET", open }, { frameId: 0 });
+    if (!response?.ok) throw new Error(response?.error || "页内抽屉没有返回结果");
+    return response.value;
+  } catch (error) {
+    const detail = error?.message || String(error);
+    if (retry && /(Receiving end does not exist|Could not establish connection)/iu.test(detail)) {
+      await chrome.scripting.executeScript({ target: { tabId, frameIds: [0] }, files: ["inline-ui.js"] });
+      return setInlinePanel(tabId, open, false);
+    }
+    throw error;
+  }
+}
+
+chrome.action.onClicked.addListener(async (tab) => {
+  if (!tab?.id || !isYuqueUrl(tab.url)) return;
+  try { await sendContent(tab.id, { type: "CAPTURE_SELECTION" }); } catch { /* 没有选区仍可读取全文。 */ }
+  try { await setInlinePanel(tab.id); } catch { /* 页面刷新后可再次打开。 */ }
 });
 
-async function emitProgress(stage, detail) {
-  try {
-    await chrome.runtime.sendMessage({ type: "APPLY_PROGRESS", stage, detail });
-  } catch {
-    // 侧边栏关闭时不影响页面操作。
-  }
-}
+chrome.tabs.onRemoved.addListener((tabId) => frameCache.delete(tabId));
+chrome.tabs.onUpdated.addListener((tabId, changeInfo) => {
+  if (changeInfo.status === "loading" || changeInfo.url) frameCache.delete(tabId);
+});
 
-async function attachDebugger(tabId) {
-  try {
-    await chrome.debugger.attach({ tabId }, DEBUG_PROTOCOL_VERSION);
-  } catch (error) {
-    throw new Error(`无法连接浏览器输入通道。请关闭该页面的开发者工具后重试。${error?.message ? `（${error.message}）` : ""}`);
-  }
-}
-
-async function debuggerCommand(tabId, method, params = {}) {
-  return chrome.debugger.sendCommand({ tabId }, method, params);
-}
-
-async function keyPress(tabId, key, code, virtualKeyCode, modifiers = 0) {
-  const common = { key, code, windowsVirtualKeyCode: virtualKeyCode, nativeVirtualKeyCode: virtualKeyCode, modifiers };
-  await debuggerCommand(tabId, "Input.dispatchKeyEvent", { type: "rawKeyDown", ...common });
-  await debuggerCommand(tabId, "Input.dispatchKeyEvent", { type: "keyUp", ...common });
-}
-
-async function insertText(tabId, text) {
-  if (text) await debuggerCommand(tabId, "Input.insertText", { text });
-  else await keyPress(tabId, "Backspace", "Backspace", 8);
-}
-
-function blockFingerprint(block) {
-  return block ? `${block.id}\u0000${block.kind}\u0000${block.text}` : null;
-}
-
-function sameBlock(left, right) {
-  return blockFingerprint(left) === blockFingerprint(right);
-}
-
-async function ensureNeighborsUnchanged(tabId, documentKey, before, blockId) {
-  const after = await sendContent(tabId, { type: "GET_BLOCK_STATE", documentKey, blockId });
-  if (!after.exists) throw new Error(`段落 ${blockId} 在写入后消失`);
-  if (!sameBlock(before.previous, after.previous) || !sameBlock(before.next, after.next)) {
-    throw new Error(`段落 ${blockId} 的相邻内容发生了意外变化`);
-  }
-  return after;
-}
-
-async function waitUntilAbsent(tabId, documentKey, blockId, timeoutMs = 2_500) {
-  const deadline = Date.now() + timeoutMs;
-  while (Date.now() < deadline) {
-    const state = await sendContent(tabId, { type: "GET_BLOCK_STATE", documentKey, blockId });
-    if (!state.exists) return true;
-    await new Promise((resolve) => setTimeout(resolve, 70));
-  }
-  throw new Error(`段落 ${blockId} 删除后校验失败`);
-}
-
-async function verifyKnownBlock(tabId, documentKey, expected) {
-  if (!expected) return;
-  const state = await sendContent(tabId, { type: "GET_BLOCK_STATE", documentKey, blockId: expected.id });
-  if (!state.exists || blockFingerprint(state.block) !== blockFingerprint(expected)) {
-    throw new Error(`相邻段落 ${expected.id} 发生了意外变化`);
-  }
-}
-
-async function applyInsert(tabId, documentKey, operation) {
-  let undoUnits = 0;
-  try {
-    const before = await sendContent(tabId, { type: "GET_BLOCK_STATE", documentKey, blockId: operation.blockId });
-    if (!before.exists || before.block.text !== operation.oldText || !before.block.canInsertAfter) {
-      throw new Error(`新建段落的锚点 ${operation.blockId} 已变化`);
-    }
-    await sendContent(tabId, {
-      type: "PLACE_CARET_END",
-      documentKey,
-      blockId: operation.blockId,
-      expectedText: operation.oldText,
-    });
-    await keyPress(tabId, "Enter", "Enter", 13);
-    undoUnits += 1;
-    await insertText(tabId, operation.newText);
-    undoUnits += 1;
-    const inserted = await sendContent(tabId, {
-      type: "WAIT_FOR_INSERT",
-      documentKey,
-      anchorId: operation.blockId,
-      expectedText: operation.newText,
-      timeoutMs: 3_000,
-    });
-    await verifyKnownBlock(tabId, documentKey, before.next);
-    return { undoUnits, insertedId: inserted.id };
-  } catch (error) {
-    error.undoUnits = (error.undoUnits || 0) + undoUnits;
-    throw error;
-  }
-}
-
-async function applyReplace(tabId, documentKey, operation) {
-  let undoUnits = 0;
-  try {
-    const before = await sendContent(tabId, { type: "GET_BLOCK_STATE", documentKey, blockId: operation.blockId });
-    if (!before.exists || before.block.text !== operation.oldText || !before.block.editable) {
-      throw new Error(`待替换段落 ${operation.blockId} 已变化`);
-    }
-    const hunks = diffToHunks(operation.oldText, operation.newText).sort((left, right) => right.start - left.start);
-    let expectedText = operation.oldText;
-    for (const hunk of hunks) {
-      await sendContent(tabId, {
-        type: "SELECT_TEXT_RANGE",
-        documentKey,
-        blockId: operation.blockId,
-        expectedText,
-        start: hunk.start,
-        end: hunk.end,
-      });
-      await insertText(tabId, hunk.newText);
-      undoUnits += 1;
-      expectedText = `${expectedText.slice(0, hunk.start)}${hunk.newText}${expectedText.slice(hunk.end)}`;
-      await sendContent(tabId, {
-        type: "WAIT_FOR_TEXT",
-        documentKey,
-        blockId: operation.blockId,
-        expectedText,
-        timeoutMs: 2_500,
-      });
-    }
-    if (expectedText !== operation.newText) throw new Error(`段落 ${operation.blockId} 的差异计算结果不一致`);
-    const after = await ensureNeighborsUnchanged(tabId, documentKey, before, operation.blockId);
-    if (after.block.text !== operation.newText) throw new Error(`段落 ${operation.blockId} 的最终文字不一致`);
-    return { undoUnits };
-  } catch (error) {
-    error.undoUnits = (error.undoUnits || 0) + undoUnits;
-    throw error;
-  }
-}
-
-async function applyDelete(tabId, documentKey, operation) {
-  let undoUnits = 0;
-  try {
-    const before = await sendContent(tabId, { type: "GET_BLOCK_STATE", documentKey, blockId: operation.blockId });
-    if (!before.exists || before.block.text !== operation.oldText || !before.block.canDelete) {
-      throw new Error(`待删除段落 ${operation.blockId} 已变化`);
-    }
-    await sendContent(tabId, {
-      type: "SELECT_WHOLE_BLOCK",
-      documentKey,
-      blockId: operation.blockId,
-      expectedText: operation.oldText,
-    });
-    await keyPress(tabId, "Backspace", "Backspace", 8);
-    undoUnits += 1;
-    await waitUntilAbsent(tabId, documentKey, operation.blockId);
-    await verifyKnownBlock(tabId, documentKey, before.previous);
-    await verifyKnownBlock(tabId, documentKey, before.next);
-    return { undoUnits };
-  } catch (error) {
-    error.undoUnits = (error.undoUnits || 0) + undoUnits;
-    throw error;
-  }
-}
-
-function executionOrder(operations, blocks) {
-  const indexById = new Map(blocks.map((block, index) => [block.id, index]));
-  const inserts = operations.filter((item) => item.op === OPERATION_TYPES.INSERT)
-    .sort((left, right) => (indexById.get(right.blockId) ?? 0) - (indexById.get(left.blockId) ?? 0));
-  const replaces = operations.filter((item) => item.op === OPERATION_TYPES.REPLACE)
-    .sort((left, right) => (indexById.get(left.blockId) ?? 0) - (indexById.get(right.blockId) ?? 0));
-  const deletes = operations.filter((item) => item.op === OPERATION_TYPES.DELETE)
-    .sort((left, right) => (indexById.get(right.blockId) ?? 0) - (indexById.get(left.blockId) ?? 0));
-  return [...inserts, ...replaces, ...deletes];
-}
-
-async function rollback(tabId, documentKey, undoUnits, expectedGuardHash) {
-  if (!undoUnits) return { restored: true, attempts: 0 };
-  await emitProgress("rollback", `写入失败，正在撤销 ${undoUnits} 个输入步骤…`);
-  for (let attempt = 1; attempt <= undoUnits; attempt += 1) {
-    await keyPress(tabId, "z", "KeyZ", 90, 2);
-    await new Promise((resolve) => setTimeout(resolve, 120));
-    const state = await sendContent(tabId, { type: "GET_GUARD", documentKey });
-    if (state.guardHash === expectedGuardHash) return { restored: true, attempts: attempt };
-  }
-  return { restored: false, attempts: undoUnits };
-}
-
-async function applyOperations(payload) {
-  const tab = await activeYuqueTab();
-  const { snapshot } = payload;
-  const currentTabDocumentKey = tab.url.split(/[?#]/u)[0];
-  if (!snapshot || (snapshot.tabDocumentKey || snapshot.documentKey) !== currentTabDocumentKey) {
-    throw new Error("当前标签页不是生成建议时的语雀文档");
-  }
-  const requestShape = {
-    sourceHash: snapshot.sourceHash,
-    blocks: snapshot.blocks,
-  };
-  const validated = validateRevisionResponse({
-    sourceHash: snapshot.sourceHash,
-    summary: "",
-    warnings: [],
-    operations: payload.operations,
-  }, requestShape);
-  if (!validated.operations.length) throw new Error("没有选中任何修改项");
-
-  await sendContent(tab.id, { type: "PING_EDITOR" });
-  const preflight = await sendContent(tab.id, { type: "GET_GUARD", documentKey: snapshot.documentKey });
-  if (preflight.guardHash !== snapshot.guardHash) {
-    throw new Error("生成建议后文档已发生变化。请重新读取文档并生成建议");
-  }
-
-  await attachDebugger(tab.id);
-  let undoUnits = 0;
-  const applied = [];
-  const insertedIds = [];
-  try {
-    const ordered = executionOrder(validated.operations, snapshot.blocks);
-    for (let index = 0; index < ordered.length; index += 1) {
-      const operation = ordered[index];
-      await emitProgress("apply", `正在应用 ${index + 1}/${ordered.length}：${operation.reason || operation.op}`);
-      let result;
-      if (operation.op === OPERATION_TYPES.INSERT) result = await applyInsert(tab.id, snapshot.documentKey, operation);
-      else if (operation.op === OPERATION_TYPES.REPLACE) result = await applyReplace(tab.id, snapshot.documentKey, operation);
-      else result = await applyDelete(tab.id, snapshot.documentKey, operation);
-      undoUnits += result.undoUnits;
-      if (result.insertedId) insertedIds.push(result.insertedId);
-      applied.push(operation);
-    }
-  } catch (error) {
-    undoUnits += Number(error?.undoUnits || 0);
-    const rollbackResult = await rollback(tab.id, snapshot.documentKey, undoUnits, snapshot.guardHash);
-    const suffix = rollbackResult.restored
-      ? "已自动撤销本批次中完成的修改。"
-      : "自动撤销未能恢复原始状态，请立即在语雀中检查并使用 Ctrl+Z。";
-    throw new Error(`${error?.message || String(error)} ${suffix}`);
-  } finally {
-    try { await chrome.debugger.detach({ tabId: tab.id }); } catch { /* 已断开时忽略 */ }
-  }
-
-  await emitProgress("save", "修改已写入，正在等待语雀保存…");
-  const save = await sendContent(tab.id, {
-    type: "WAIT_FOR_SAVE",
-    documentKey: snapshot.documentKey,
-    timeoutMs: 15_000,
-  });
-  if (save.saved === false) throw new Error(save.error || "语雀保存失败");
-  return {
-    appliedCount: applied.length,
-    operations: applied,
-    insertedIds,
-    saved: save.saved,
-    warning: save.warning || "",
-  };
-}
-
-chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
-  if (message?.type === "APPLY_PROGRESS") return false;
+chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
+  if (message?.type === "PARSE_PROGRESS") return false;
   const handlers = {
-    GET_EDITOR_STATUS: async () => {
-      const tab = await activeYuqueTab();
-      const frame = await discoverEditorFrame(tab.id, true);
-      const status = await sendContent(tab.id, { type: "PING_EDITOR" });
-      return { ...status, frame: frame.diagnostic, frameCount: frame.allDiagnostics.length };
+    GET_PAGE_STATUS: async () => {
+      const tab = await tabForSender(sender);
+      const frame = await discoverContentFrame(tab.id, true);
+      const status = await sendContent(tab.id, { type: "GET_PAGE_STATUS" });
+      return { ...status, tabId: tab.id, frame: frame.diagnostic, frameCount: frame.frameCount };
     },
-    EXTRACT_DOCUMENT: async () => {
-      const tab = await activeYuqueTab();
-      const frame = await discoverEditorFrame(tab.id, true);
-      const snapshot = await sendContent(tab.id, { type: "COLLECT_DOCUMENT", scope: message.scope });
-      return {
-        ...snapshot,
-        title: snapshot.title || tab.title || "",
-        tabDocumentKey: tab.url.split(/[?#]/u)[0],
-        frameDiagnostic: frame.diagnostic,
-        frameCount: frame.allDiagnostics.length,
-      };
+    CAPTURE_SELECTION: async () => {
+      const tab = await tabForSender(sender);
+      return sendContent(tab.id, { type: "CAPTURE_SELECTION" });
     },
-    APPLY_OPERATIONS: () => applyOperations(message),
+    PARSE_PAGE: async () => {
+      const tab = await tabForSender(sender);
+      return sendContent(tab.id, { type: "PARSE_PAGE", scope: message.scope === "selection" ? "selection" : "document" });
+    },
+    GET_CURRENT_LAKE: async () => {
+      const tab = await tabForSender(sender);
+      return getCurrentLake(tab.id);
+    },
+    TOGGLE_INLINE_PANEL: async () => {
+      const tab = await tabForSender(sender);
+      return setInlinePanel(tab.id, typeof message.open === "boolean" ? message.open : undefined);
+    },
+    INLINE_DOCUMENT_CHANGED: async () => {
+      const tab = await tabForSender(sender);
+      frameCache.delete(tab.id);
+      return true;
+    },
   };
   const handler = handlers[message?.type];
   if (!handler) return false;

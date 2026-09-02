@@ -1,0 +1,60 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <title>脱敏测试文档 · 语雀</title>
+  <style>
+    body { margin: 0; min-height: 1200px; font: 16px/1.7 sans-serif; background: #fff; }
+    #toolbar { position: sticky; top: 0; padding: 12px 24px; background: #f4f7f5; }
+    .ne-engine { display: block; width: 720px; min-height: 900px; margin: 24px auto; padding: 24px; outline: 1px solid #dde6df; }
+    ne-p, ne-h2, ne-tli, ne-uli-c, ne-heading-content, ne-card, ne-table, ne-codeblock, ne-collapse { display: block; }
+    ne-p, ne-h2, ne-tli { margin: 10px 0; }
+    ne-heading-ext, ne-uli-i { display: inline-block; }
+  </style>
+</head>
+<body>
+  <div id="toolbar"><span data-testid="DocSaveTip:saved">已保存 12:00:00</span></div>
+  <div class="ne-engine ne-typography-classic" contenteditable="true">
+    <ne-p id="p1" ne-brick="true"><ne-text id="t1">第一段错吴</ne-text><span class="ne-b-filler"><br></span></ne-p>
+    <ne-p id="p2" ne-brick="true"><ne-text id="t2">包含</ne-text><ne-text ne-bold="true" id="t3">加粗文字</ne-text><ne-text id="t4">的段落</ne-text><span class="ne-b-filler"><br></span></ne-p>
+    <ne-h2 id="h1" ne-brick="true" ne-role="render-unit">
+      <ne-heading-ext contenteditable="false"><ne-heading-anchor><span>§</span></ne-heading-anchor></ne-heading-ext>
+      <ne-heading-content><ne-text id="ht1">一、 组织部负责人1</ne-text><span class="ne-b-filler"><br></span></ne-heading-content>
+    </ne-h2>
+    <ne-tli id="l1" ne-brick="true" ne-role="render-unit">
+      <ne-uli-i contenteditable="false"><span class="ne-list-symbol"><span>•</span></span></ne-uli-i>
+      <ne-uli-c class="ne-uli-content"><ne-text id="lt1">1列表正文</ne-text><span class="ne-b-filler"><br></span></ne-uli-c>
+    </ne-tli>
+    <ne-p id="link1" ne-brick="true"><ne-link id="a1"><ne-link-content><ne-text id="at1">只读链接</ne-text></ne-link-content></ne-link><span class="ne-b-filler"><br></span></ne-p>
+    <ne-card id="card1" name="diagram">卡片内容</ne-card>
+    <ne-table id="table1"><table><tbody><tr><td><ne-p id="cell1"><ne-text>表格内容</ne-text><span class="ne-b-filler"><br></span></ne-p></td></tr></tbody></table></ne-table>
+    <ne-codeblock id="code1">const protectedValue = true;</ne-codeblock>
+    <ne-collapse id="collapse1"><ne-summary>折叠标题</ne-summary><ne-p id="folded1"><ne-text>折叠内容</ne-text><span class="ne-b-filler"><br></span></ne-p></ne-collapse>
+  </div>
+  <script>
+    window.appData = {
+      book: { id: 12345, slug: "book", toc: [] },
+      doc: { book_id: 12345, title: "脱敏测试文档", slug: "fixture" },
+    };
+    // 模拟 Lake 的内部选区比 DOM Range 滞后：只有可信方向键会让它同步。
+    // 如果扩展直接在程序选区上按 Delete，模拟器会像真实故障一样清空整个标题。
+    const editor = document.querySelector(".ne-engine");
+    let lakeHeadingSelection = "entire-heading";
+    editor.addEventListener("keyup", (event) => {
+      if (!event.key.startsWith("Arrow")) return;
+      const selection = getSelection();
+      if (selection?.anchorNode && document.querySelector("#h1")?.contains(selection.anchorNode)) {
+        lakeHeadingSelection = selection.toString();
+      }
+    }, true);
+    editor.addEventListener("keydown", (event) => {
+      if (event.key !== "Delete") return;
+      const selection = getSelection();
+      if (!selection?.anchorNode || !document.querySelector("#h1")?.contains(selection.anchorNode)) return;
+      if (lakeHeadingSelection === selection.toString()) return;
+      event.preventDefault();
+      document.querySelector("#ht1").textContent = "";
+    }, true);
+  </script>
+</body>
+</html>

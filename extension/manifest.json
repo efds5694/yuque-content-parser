@@ -1,30 +1,22 @@
 {
   "manifest_version": 3,
-  "name": "语雀 AI 编辑器",
-  "version": "0.1.3",
-  "description": "使用本地 Codex 审阅并安全写回语雀原文档",
+  "name": "语雀内容解析器",
+  "version": "0.3.0",
+  "description": "一键读取当前语雀文档或解析 .lake 文件，生成适合 AI 使用的 Markdown、富文本和 JSON",
   "permissions": [
-    "activeTab",
-    "debugger",
-    "scripting",
-    "sidePanel",
-    "storage",
-    "webNavigation"
+    "clipboardWrite",
+    "scripting"
   ],
   "host_permissions": [
     "https://www.yuque.com/*",
-    "https://*.yuque.com/*",
-    "http://127.0.0.1/*"
+    "https://*.yuque.com/*"
   ],
   "background": {
     "service_worker": "background.js",
     "type": "module"
   },
   "action": {
-    "default_title": "打开语雀 AI 编辑器"
-  },
-  "side_panel": {
-    "default_path": "sidepanel.html"
+    "default_title": "打开语雀内容解析器"
   },
   "content_scripts": [
     {
@@ -32,10 +24,24 @@
         "https://www.yuque.com/*",
         "https://*.yuque.com/*"
       ],
-      "js": ["content.js"],
+      "js": ["content.js", "inline-ui.js"],
       "run_at": "document_idle",
       "all_frames": true,
       "match_about_blank": true
+    }
+  ],
+  "web_accessible_resources": [
+    {
+      "resources": [
+        "sidepanel.html",
+        "sidepanel.css",
+        "sidepanel.js",
+        "lib/*.js"
+      ],
+      "matches": [
+        "https://www.yuque.com/*",
+        "https://*.yuque.com/*"
+      ]
     }
   ]
 }
